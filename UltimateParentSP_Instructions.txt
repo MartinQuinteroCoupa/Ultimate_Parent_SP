@@ -1,0 +1,182 @@
+================================================================================
+ UltimateParentSP - Instructions
+ Location: [aic_data].[dbo].[UltimateParentSP]
+================================================================================
+
+
+--------------------------------------------------------------------------------
+ 1. PROCESS DESCRIPTION
+--------------------------------------------------------------------------------
+
+Populates the [Ultimate Parent] field (parent company of a supplier) in the
+tblRefresh table of a client database. It uses the lookup table luUParent of
+that same database, and GenAI to suggest parents for suppliers not seen before.
+
+Steps:
+
+  Step 0  If luUParent does not exist in the client database, it is created.
+
+  Step 1  Retrieve the Top 100 [Normalized Supplier] values in tblRefresh,
+          ranked by SUM([Spend]). Empty or NULL suppliers are ignored.
+
+  Step 2  Keep only the suppliers that are not yet in luUParent. They are
+          stored in the staging table gptUParent.
+
+  Step 2.1 If there are new suppliers, they are sent to GenAI (through the
+          GenAIConnection stored procedure) to get their Ultimate Parent.
+          The answers are cleaned and appended to luUParent with
+          [Source] = 'AI':
+            - A valid parent name    -> saved with that parent.
+            - "UNKNOWN"              -> saved with [Ultimate Parent] = NULL,
+                                        so it is not sent to GenAI again and
+                                        can be completed manually.
+            - Error or empty answer  -> NOT saved. It is retried on the next
+                                        run if the supplier is still in the
+                                        Top 100.
+
+  Step 3  Update tblRefresh.[Ultimate Parent] for ALL suppliers found in
+          luUParent (not only this run's Top 100), joining on
+          [Normalized Supplier].
+
+The lookup is incremental: every run adds new suppliers to luUParent, so the
+coverage of tblRefresh grows over time. Suppliers that have never been in a
+Top 100 keep [Ultimate Parent] = NULL.
+
+
+--------------------------------------------------------------------------------
+ 2. INSTRUCTIONS
+--------------------------------------------------------------------------------
+
+2.1 Running the procedure
+-------------------------
+
+  EXEC [aic_data].[dbo].[UltimateParentSP] @client_db_name = 'client_db_name';
+
+  Parameter:
+    @client_db_name   Name of the client database to process (required).
+                      If the database name contains a hyphen, see
+                      section 3.2.
+
+  The procedure can be run from any database, from a SQL script with more
+  steps, or from a SQL Agent Job.
+
+
+2.2 Reading the run log
+-----------------------
+
+  The procedure prints progress messages in the "Messages" tab of SSMS.
+  They are shown as each step runs. Example:
+
+    UltimateParentSP started for database client_db_name
+    Step 1-2: 12 new suppliers in Top 100 not found in luUParent
+    Step 2.1: sending 12 suppliers to GenAI...
+    Step 2.1: 9 parents assigned by GenAI
+    Step 2.1: 2 suppliers returned UNKNOWN (saved with NULL parent)
+    Step 2.1: 1 suppliers failed (error or empty answer), will be retried next run
+    Step 3: 48210 rows updated in tblRefresh
+    15 suppliers in luUParent pending manual review (Ultimate Parent is NULL)
+    UltimateParentSP finished
+
+  - "pending manual review" is the TOTAL count in luUParent, not only this
+    run's count.
+  - GenAIConnection also returns its own output in the "Results" tab.
+  - When running from a SQL Agent Job, the job history keeps only part of the
+    messages. To keep the full log, set an "Output file" in the job step
+    (Advanced tab).
+
+
+2.3 Manual review and corrections
+---------------------------------
+
+  Suppliers pending review:
+
+    SELECT * FROM [client_db_name].dbo.luUParent
+    WHERE [Ultimate Parent] IS NULL;
+
+  To fill in or correct a parent, update luUParent and set
+  [Source] = 'Manual':
+
+    UPDATE [client_db_name].dbo.luUParent
+    SET [Ultimate Parent] = 'Parent Company Name',
+        [Source] = 'Manual'
+    WHERE [Normalized Supplier] = 'Supplier Name';
+
+  To add a supplier manually, insert it into luUParent. [Source] defaults to
+  'Manual' when it is not given.
+
+  Corrections reach tblRefresh the next time the procedure runs. Running it
+  again right away is safe: if there are no new suppliers, GenAI is not called.
+
+  Keep parent names consistent (e.g. always "Alphabet Inc.", not a mix of
+  "Alphabet", "Alphabet Inc" and "Alphabet Inc."). Otherwise, spend is split
+  across several "different" parents.
+
+
+2.4 Tables involved (in the client database)
+--------------------------------------------
+
+  tblRefresh   Source data. Read for the Top 100. [Ultimate Parent] is
+               updated.
+  luUParent    Lookup table. One row per [Normalized Supplier].
+                 [Normalized Supplier]  NVARCHAR(255)  Primary key
+                 [Ultimate Parent]      NVARCHAR(255)  NULL allowed
+                 [Source]               NVARCHAR(20)   'AI' or 'Manual'
+  gptUParent   Staging table for the GenAI call. It is dropped and re-created
+               on every run. It is kept after the run so the raw GenAI answers
+               ([Completion]) can be reviewed.
+
+
+--------------------------------------------------------------------------------
+ 3. CONSTRAINTS & RESTRICTIONS
+--------------------------------------------------------------------------------
+
+3.1 Prerequisites
+-----------------
+
+  - luUParent: none. The procedure creates it if it does not exist.
+  - tblRefresh must exist in the client database with the columns
+    [Normalized Supplier] NVARCHAR(255), [Spend] and [Ultimate Parent].
+  - [aic_data].[dbo].[GenAIConnection] must exist, and the user running the
+    procedure needs permission to run it (it uses xp_cmdshell).
+  - SQL Server 2016 SP1 or later (uses CREATE OR ALTER and DROP TABLE IF
+    EXISTS).
+
+
+3.2 Database names with hyphens
+-------------------------------
+
+  GenAIConnection passes the database name to a Python process as a
+  hyphen-separated command, so a hyphen in the name breaks the call.
+
+  To stay aligned with GenAIConnection, the only exception currently
+  supported is:
+
+    Database name   Value to pass in @client_db_name
+    -------------   --------------------------------
+    uth-tmc         uth_tmc
+
+  Any other database with a hyphen in its name is NOT supported. Supporting a
+  new one requires adding the same exception in GenAIConnection (and possibly
+  in the Python process) first, and then in UltimateParentSP.
+
+
+3.3 Other restrictions
+----------------------
+
+  - Do NOT run the procedure inside an open transaction (BEGIN TRAN ... in the
+    calling script). The GenAI step runs a separate process with its own
+    connection. That process would wait on the caller's locks and the run
+    would hang.
+  - Do not run the procedure twice at the same time on the same database
+    (both runs share the gptUParent staging table). Runs on different
+    databases at the same time are fine.
+  - The name gptUParent is reserved in each client database. Any existing
+    table with that name is dropped.
+  - Only the Top 100 suppliers by spend are sent to GenAI on each run.
+  - The procedure only updates tblRefresh. tblHistorical is not modified.
+  - GenAI answers longer than 255 characters are discarded (treated as a
+    failed answer and retried on the next run).
+  - GenAI answers can be wrong. Review luUParent periodically, mainly the
+    rows with [Source] = 'AI'.
+  - The column names are fixed: [Normalized Supplier], [Spend],
+    [Ultimate Parent].
